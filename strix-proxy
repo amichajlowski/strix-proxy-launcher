@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# Wrapper: ensure CLIProxyAPI healthy + Codex token valid, then exec strix.
+# Pass-through: all args go to strix.
+# Override env: PROXY_DIR, STRIX_BIN, STRIX_PROXY_MODEL, STRIX_PROXY_PROBE=0 (skip live probe).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROXY_DIR="${PROXY_DIR:-$SCRIPT_DIR}"
+PROXY_URL="http://127.0.0.1:8317"
+PROXY_BASE="$PROXY_URL/v1"
+STRIX_BIN="${STRIX_BIN:-$HOME/.strix/bin/strix}"
+STRIX_PROXY_MODEL="${STRIX_PROXY_MODEL:-gpt-5.5}"
+STRIX_PROXY_PROBE="${STRIX_PROXY_PROBE:-1}"
+STRIX_PROXY_KEYCHAIN_SERVICE="${STRIX_PROXY_KEYCHAIN_SERVICE:-cliproxyapi-key}"
+STRIX_PROXY_KEYCHAIN_ACCOUNT="${STRIX_PROXY_KEYCHAIN_ACCOUNT:-$USER}"
+COMPOSE=(docker compose -f "$PROXY_DIR/docker-compose.yml")
+
+B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'
+step() { printf "${B}▸${N} %s\n" "$*"; }
+ok()   { printf "  ${G}✓${N} %s\n" "$*"; }
+warn() { printf "  ${Y}!${N} %s\n" "$*"; }
+fail() { printf "  ${R}✗${N} %s\n" "$*" >&2; }
+die()  { fail "$*"; exit 1; }
+
+show_help() {
+  cat <<'HELP'
+strix-proxy — Strix penetration-testing CLI routed through a local CLIProxyAPI
+              container backed by a paid ChatGPT (Codex OAuth) subscription.
+
+WHAT IT DOES
+  Wrapper around `strix` that guarantees the local OpenAI-compatible proxy is
+  healthy before launching strix. Pre-flight order:
+    1. Verify Docker daemon, install dir, .api-key, strix binary.
+    2. Ensure the cli-proxy-api container is running; start it if stopped.
+    3. Wait up to 30 s for GET /v1/models to respond.
+    4. Confirm at least one codex-*.json auth file exists inside the container.
+    5. Live probe POST /v1/chat/completions with a tiny "ping" — catches
+       expired refresh tokens that /v1/models alone wouldn't flag.
+    6. If the token is missing or rejected, run `--codex-login` interactively
+       inside the container; user pastes the OAuth callback URL; re-probe.
+    7. Export STRIX_LLM / LLM_API_KEY / LLM_API_BASE and exec `strix` with
+       every original argument passed through verbatim.
+
+USAGE
+  strix-proxy [--help|-h]                 Show this help and exit.
+  strix-proxy <strix args ...>            Run strix through the proxy.
+
+  All strix flags pass through unchanged. Common examples:
+    strix-proxy -t /path/to/repo --scan-mode quick -n
+    strix-proxy -t https://example.com --instruction "Focus on IDOR"
+    strix-proxy --version
+
+REASONING EFFORT (thinking mode)
+  gpt-5.5 supports four discrete levels — low, medium, high, xhigh — exposed
+  by CLIProxyAPI for the codex provider. Higher levels produce deeper analysis
+  at roughly proportional token cost and latency.
+
+  Default selection by the wrapper (highest precedence first):
+    1. STRIX_REASONING_EFFORT=<level>     (explicit override; passed through)
+    2. STRIX_PROXY_EFFORT=<level>         (wrapper-specific explicit override)
+    3. Auto-bump to "high" when args include  -m deep  or  --scan-mode deep
+    4. Otherwise no override → CLIProxyAPI's default "medium" applies.
+
+  When a level is chosen the wrapper sets it two ways for robustness:
+    - STRIX_LLM="openai/gpt-5.5(<level>)"  (model-suffix; server enforces it)
+    - STRIX_REASONING_EFFORT=<level>       (in case strix forwards it)
+
+  Examples:
+    # Force xhigh on a deep scan (recommended for high-stakes audits)
+    STRIX_REASONING_EFFORT=xhigh strix-proxy -t /path/to/app -m deep -n
+
+    # Cheap & fast — explicit low
+    STRIX_PROXY_EFFORT=low strix-proxy -t /path/to/app -m quick -n
+
+    # Auto: deep → high (no env needed)
+    strix-proxy -t /path/to/app -m deep -n
+
+    # Default medium (no env, not deep)
+    strix-proxy -t /path/to/app -m standard
+
+  Rough cost guidance (your smoke run at medium was ≈ $1):
+    low      0.3–0.5×  · cheapest, shallow findings
+    medium   1×        · balanced (default)
+    high     2–4×      · deeper triage, recommended for -m deep
+    xhigh    4–8×      · maximum depth, slow; use for critical audits
+
+SECRET HANDLING
+  The proxy API key is stored in the macOS login Keychain, not on disk.
+  At launch, the wrapper calls `security find-generic-password` to fetch it
+  and exports it as LLM_API_KEY only for the strix child process — it is
+  never written to a file, shell rc, history, or log.
+
+  One-time setup (already done on this machine):
+    security add-generic-password \
+      -a "$USER" -s cliproxyapi-key -w '<your-api-key>' -U
+
+  Rotating the key:
+    1. Pick a new entry in $PROXY_DIR/config.yaml under api-keys.
+    2. Re-run the add-generic-password command above with -U (update).
+
+ENVIRONMENT OVERRIDES (set inline or export beforehand)
+  PROXY_DIR                       CLIProxyAPI install directory.
+                                  Default: directory containing this wrapper.
+  STRIX_BIN                       Path to the strix executable.
+                                  Default: $HOME/.strix/bin/strix
+  STRIX_PROXY_MODEL               Model id served by CLIProxyAPI (becomes
+                                  STRIX_LLM=openai/<model>). Default: gpt-5.5
+                                  Available examples: gpt-5.5, gpt-5.4,
+                                  gpt-5.4-mini, gpt-5.3-codex, gpt-5.2.
+                                  NOTE: gpt-5.5 currently drops streams on
+                                  Strix-shaped pentest prompts (verified
+                                  2026-05-13). Pending OpenAI TAC approval
+                                  for security testing on this account.
+                                  Fallback: STRIX_PROXY_MODEL=gpt-5.4 …
+  STRIX_PROXY_PROBE               1 (default) runs the live token probe; 0
+                                  skips it for faster start-up. Skipping
+                                  means expired refresh tokens are only
+                                  detected once strix itself fails.
+  STRIX_PROXY_EFFORT              Reasoning level: low | medium | high | xhigh.
+                                  Overrides the deep-scan auto-bump. See the
+                                  REASONING EFFORT section above.
+  STRIX_REASONING_EFFORT          Same as STRIX_PROXY_EFFORT, but also exported
+                                  unchanged to the strix child process. Use
+                                  this if strix itself reads it. Takes
+                                  precedence over STRIX_PROXY_EFFORT.
+  STRIX_PROXY_KEYCHAIN_SERVICE    Keychain service name. Default: cliproxyapi-key
+  STRIX_PROXY_KEYCHAIN_ACCOUNT    Keychain account name. Default: $USER
+
+EXIT CODES
+  0   strix exited cleanly.
+  1   Pre-flight failure (Docker, missing files, proxy unreachable, token
+      cannot be refreshed, etc.).
+  *   Any non-zero status from strix propagates unchanged.
+
+FILES
+  $PROXY_DIR/docker-compose.yml   Container definition.
+  $PROXY_DIR/config.yaml          Proxy config (host, api-keys, etc.).
+  $PROXY_DIR/auths/codex-*.json   Codex OAuth token store (per container).
+  (No .api-key file — the key lives in the macOS Keychain.)
+
+MANUAL OPS
+  Stop proxy:    docker compose -f "$PROXY_DIR/docker-compose.yml" down
+  Start proxy:   docker compose -f "$PROXY_DIR/docker-compose.yml" up -d
+  Force re-login (also triggered automatically when probe fails):
+                 docker compose -f "$PROXY_DIR/docker-compose.yml" \
+                   exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI \
+                   -no-browser --codex-login
+  Tail logs:     docker compose -f "$PROXY_DIR/docker-compose.yml" \
+                   logs -f cli-proxy-api
+
+NOTES
+  - Host port 8317 is bound to 127.0.0.1 only; the proxy is not reachable
+    from other machines.
+  - This setup is for internal R&D use only — do not use on client
+    engagements.
+HELP
+}
+
+case "${1:-}" in
+  --help|-h|help) show_help; exit 0 ;;
+esac
+
+[[ -d "$PROXY_DIR" ]] || die "PROXY_DIR not found: $PROXY_DIR"
+[[ -f "$PROXY_DIR/docker-compose.yml" ]] || die "docker-compose.yml missing in $PROXY_DIR"
+[[ -x "$STRIX_BIN" ]] || die "strix binary not executable: $STRIX_BIN"
+command -v security >/dev/null || die "macOS 'security' command not found (Keychain unavailable)"
+
+# Fetch proxy API key from the login Keychain. No cleartext key on disk.
+if ! KEY="$(security find-generic-password \
+              -a "$STRIX_PROXY_KEYCHAIN_ACCOUNT" \
+              -s "$STRIX_PROXY_KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
+  cat >&2 <<EOF
+${R}✗${N} Proxy API key not found in Keychain.
+   Service : $STRIX_PROXY_KEYCHAIN_SERVICE
+   Account : $STRIX_PROXY_KEYCHAIN_ACCOUNT
+
+   Add it (one-time) with:
+     security add-generic-password \\
+       -a "$STRIX_PROXY_KEYCHAIN_ACCOUNT" \\
+       -s "$STRIX_PROXY_KEYCHAIN_SERVICE" \\
+       -w '<your-api-key>' -U
+
+   The key value must match an entry in $PROXY_DIR/config.yaml api-keys.
+EOF
+  exit 1
+fi
+# Trim any trailing newline that 'security -w' may print.
+KEY="${KEY%$'\n'}"
+[[ -n "$KEY" ]] || die "Keychain returned an empty API key"
+
+step "Preflight"
+
+# 1. Docker daemon
+if ! docker info >/dev/null 2>&1; then
+  die "Docker daemon not running. Start Docker Desktop first."
+fi
+ok "Docker daemon reachable"
+
+# 2. Container state
+container_state="$("${COMPOSE[@]}" ps --format json cli-proxy-api 2>/dev/null | python3 -c '
+import sys, json
+try:
+    raw = sys.stdin.read().strip()
+    if not raw: print("absent"); sys.exit()
+    # docker compose ps emits either array or NDJSON depending on version
+    if raw.startswith("["):
+        data = json.loads(raw)
+    else:
+        data = [json.loads(l) for l in raw.splitlines() if l]
+    if not data: print("absent"); sys.exit()
+    s = data[0].get("State", "absent")
+    print(s)
+except Exception:
+    print("absent")
+' 2>/dev/null || echo "absent")"
+
+case "$container_state" in
+  running) ok "Container running" ;;
+  *)       warn "Container state: $container_state — starting"
+           "${COMPOSE[@]}" up -d >/dev/null
+           ok "Container started" ;;
+esac
+
+# 3. Wait for /v1/models
+printf "  ${D}…${N} waiting for proxy "
+ready=0
+for i in $(seq 1 30); do
+  if curl -fsS -H "Authorization: Bearer $KEY" -m 2 "$PROXY_BASE/models" >/dev/null 2>&1; then
+    ready=1; break
+  fi
+  printf "."; sleep 1
+done
+printf "\n"
+[[ $ready -eq 1 ]] || die "Proxy did not respond on $PROXY_URL within 30s. Logs: ${COMPOSE[*]} logs --tail=100 cli-proxy-api"
+ok "Proxy /v1/models reachable"
+
+# 4. Auth file presence (inside container)
+auth_count="$("${COMPOSE[@]}" exec -T cli-proxy-api sh -c 'ls /root/.cli-proxy-api/codex-*.json 2>/dev/null | wc -l' | tr -d ' \r\n' || echo 0)"
+if [[ "$auth_count" == "0" ]]; then
+  warn "No Codex auth token present — login required"
+  need_login=1
+else
+  ok "Codex auth file present ($auth_count)"
+  need_login=0
+fi
+
+# 5. Live token probe (catches expired refresh tokens that /v1/models alone won't detect)
+if [[ "$need_login" -eq 0 && "$STRIX_PROXY_PROBE" == "1" ]]; then
+  probe_body='{"model":"'"$STRIX_PROXY_MODEL"'","messages":[{"role":"user","content":"ping"}]}'
+  probe_resp="$(curl -sS -o /tmp/strix-proxy-probe.json -w '%{http_code}' \
+    -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+    -m 30 -d "$probe_body" "$PROXY_BASE/chat/completions" 2>/dev/null || echo "000")"
+  case "$probe_resp" in
+    200) ok "Token live (probe to $STRIX_PROXY_MODEL succeeded)" ;;
+    401|403)
+      warn "Probe returned $probe_resp — Codex OAuth likely expired"
+      need_login=1 ;;
+    *)
+      warn "Probe HTTP $probe_resp — assuming token issue; response head:"
+      head -c 400 /tmp/strix-proxy-probe.json 2>/dev/null; printf "\n"
+      need_login=1 ;;
+  esac
+fi
+
+# 6. Login flow if needed
+if [[ "$need_login" -eq 1 ]]; then
+  step "Codex OAuth login"
+  cat <<EOF
+  An interactive login is required.
+  Steps:
+    1. The next command prints an authorisation URL.
+    2. Open the URL in your browser, sign in to ChatGPT.
+    3. The browser redirects to a localhost URL that will look like it fails to load — that's fine.
+    4. Copy the FULL redirect URL from the address bar.
+    5. Paste it back into this terminal.
+  Press Enter to start, or Ctrl+C to abort.
+EOF
+  read -r _
+  "${COMPOSE[@]}" exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-login
+  # File watcher picks up the new token; give it a beat then re-probe.
+  sleep 2
+  if ! curl -fsS -m 30 -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+       -d "{\"model\":\"$STRIX_PROXY_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+       "$PROXY_BASE/chat/completions" >/dev/null 2>&1; then
+    die "Post-login probe still failing. Check: ${COMPOSE[*]} logs --tail=100 cli-proxy-api"
+  fi
+  ok "Token refreshed and probe succeeded"
+fi
+
+step "Resolving reasoning effort"
+# Precedence:
+#   1. STRIX_REASONING_EFFORT (explicit env)
+#   2. STRIX_PROXY_EFFORT     (explicit env, wrapper-specific)
+#   3. auto: "high" when args include '-m deep' or '--scan-mode deep'
+#   4. unset → CLIProxyAPI default ("medium") applies
+valid_efforts=" low medium high xhigh "
+effort=""
+effort_source=""
+if [[ -n "${STRIX_REASONING_EFFORT:-}" ]]; then
+  effort="$STRIX_REASONING_EFFORT"; effort_source="STRIX_REASONING_EFFORT"
+elif [[ -n "${STRIX_PROXY_EFFORT:-}" ]]; then
+  effort="$STRIX_PROXY_EFFORT";     effort_source="STRIX_PROXY_EFFORT"
+else
+  prev=""
+  for a in "$@"; do
+    if [[ "$prev" == "-m" || "$prev" == "--scan-mode" ]] && [[ "$a" == "deep" ]]; then
+      effort="high"; effort_source="auto (--scan-mode deep)"; break
+    fi
+    if [[ "$a" == "--scan-mode=deep" ]]; then
+      effort="high"; effort_source="auto (--scan-mode=deep)"; break
+    fi
+    prev="$a"
+  done
+fi
+if [[ -n "$effort" ]]; then
+  if [[ "$valid_efforts" != *" $effort "* ]]; then
+    die "Invalid effort '$effort'. Allowed: low, medium, high, xhigh."
+  fi
+  ok "Effort: $effort ($effort_source)"
+else
+  ok "Effort: medium (CLIProxyAPI default — no override)"
+fi
+
+step "Launching strix"
+if [[ -n "$effort" ]]; then
+  # Belt-and-braces: encode effort in both the model suffix (server-side,
+  # always wins) and the STRIX_REASONING_EFFORT env (in case strix forwards it).
+  export STRIX_LLM="openai/${STRIX_PROXY_MODEL}(${effort})"
+  export STRIX_REASONING_EFFORT="$effort"
+else
+  export STRIX_LLM="openai/$STRIX_PROXY_MODEL"
+fi
+export LLM_API_KEY="$KEY"
+export LLM_API_BASE="$PROXY_BASE"
+printf "  ${D}STRIX_LLM=%s${N}\n" "$STRIX_LLM"
+printf "  ${D}LLM_API_BASE=%s${N}\n" "$LLM_API_BASE"
+printf "  ${D}LLM_API_KEY=%s***%s${N}\n" "${KEY:0:4}" "${KEY: -4}"
+[[ -n "$effort" ]] && printf "  ${D}STRIX_REASONING_EFFORT=%s${N}\n" "$effort"
+printf "\n"
+
+exec "$STRIX_BIN" "$@"
