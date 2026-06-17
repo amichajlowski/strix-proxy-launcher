@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # Wrapper: ensure CLIProxyAPI healthy + Codex token valid, then exec strix.
 # Pass-through: all args go to strix.
-# Override env: PROXY_DIR, STRIX_BIN, STRIX_PROXY_MODEL, STRIX_PROXY_PROBE=0 (skip live probe).
+# Override env: PROXY_DIR, STRIX_BIN, STRIX_PROXY_API_KEY, STRIX_PROXY_BASE,
+# STRIX_PROXY_MODEL, STRIX_PROXY_PROBE=0 (skip live probe).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROXY_DIR="${PROXY_DIR:-$SCRIPT_DIR}"
-PROXY_URL="http://127.0.0.1:8317"
-PROXY_BASE="$PROXY_URL/v1"
+PROXY_BASE="${STRIX_PROXY_BASE:-${LLM_API_BASE:-http://127.0.0.1:8317/v1}}"
+PROXY_BASE="${PROXY_BASE%/}"
+PROXY_URL="${PROXY_BASE%/v1}"
 STRIX_BIN="${STRIX_BIN:-$HOME/.strix/bin/strix}"
 STRIX_PROXY_MODEL="${STRIX_PROXY_MODEL:-gpt-5.5}"
 STRIX_PROXY_PROBE="${STRIX_PROXY_PROBE:-1}"
 STRIX_PROXY_KEYCHAIN_SERVICE="${STRIX_PROXY_KEYCHAIN_SERVICE:-cliproxyapi-key}"
-STRIX_PROXY_KEYCHAIN_ACCOUNT="${STRIX_PROXY_KEYCHAIN_ACCOUNT:-$USER}"
+STRIX_PROXY_KEYCHAIN_ACCOUNT="${STRIX_PROXY_KEYCHAIN_ACCOUNT:-${USER:-$(id -un 2>/dev/null || printf user)}}"
 COMPOSE=(docker compose -f "$PROXY_DIR/docker-compose.yml")
 
 B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'
@@ -31,7 +33,7 @@ strix-proxy — Strix penetration-testing CLI routed through a local CLIProxyAPI
 WHAT IT DOES
   Wrapper around `strix` that guarantees the local OpenAI-compatible proxy is
   healthy before launching strix. Pre-flight order:
-    1. Verify Docker daemon, install dir, .api-key, strix binary.
+    1. Verify Docker daemon, install dir, API key, strix binary.
     2. Ensure the cli-proxy-api container is running; start it if stopped.
     3. Wait up to 30 s for GET /v1/models to respond.
     4. Confirm at least one codex-*.json auth file exists inside the container.
@@ -86,12 +88,15 @@ REASONING EFFORT (thinking mode)
     xhigh    4–8×      · maximum depth, slow; use for critical audits
 
 SECRET HANDLING
-  The proxy API key is stored in the macOS login Keychain, not on disk.
-  At launch, the wrapper calls `security find-generic-password` to fetch it
-  and exports it as LLM_API_KEY only for the strix child process — it is
-  never written to a file, shell rc, history, or log.
+  The proxy API key is resolved in this order:
+    1. STRIX_PROXY_API_KEY
+    2. LLM_API_KEY
+    3. macOS login Keychain, when the `security` command is available
 
-  One-time setup (already done on this machine):
+  On Linux/Kali, prefer an environment variable:
+    export STRIX_PROXY_API_KEY='<your-api-key>'
+
+  On macOS, you may use Keychain instead:
     security add-generic-password \
       -a "$USER" -s cliproxyapi-key -w '<your-api-key>' -U
 
@@ -104,6 +109,12 @@ ENVIRONMENT OVERRIDES (set inline or export beforehand)
                                   Default: directory containing this wrapper.
   STRIX_BIN                       Path to the strix executable.
                                   Default: $HOME/.strix/bin/strix
+  STRIX_PROXY_API_KEY             Proxy API key. Preferred on Linux/Kali.
+                                  Falls back to LLM_API_KEY, then macOS
+                                  Keychain if available.
+  STRIX_PROXY_BASE                OpenAI-compatible proxy base URL.
+                                  Falls back to LLM_API_BASE, then
+                                  http://127.0.0.1:8317/v1.
   STRIX_PROXY_MODEL               Model id served by CLIProxyAPI (becomes
                                   STRIX_LLM=openai/<model>). Default: gpt-5.5
                                   Available examples: gpt-5.5, gpt-5.4,
@@ -137,7 +148,6 @@ FILES
   $PROXY_DIR/docker-compose.yml   Container definition.
   $PROXY_DIR/config.yaml          Proxy config (host, api-keys, etc.).
   $PROXY_DIR/auths/codex-*.json   Codex OAuth token store (per container).
-  (No .api-key file — the key lives in the macOS Keychain.)
 
 MANUAL OPS
   Stop proxy:    docker compose -f "$PROXY_DIR/docker-compose.yml" down
@@ -164,18 +174,26 @@ esac
 [[ -d "$PROXY_DIR" ]] || die "PROXY_DIR not found: $PROXY_DIR"
 [[ -f "$PROXY_DIR/docker-compose.yml" ]] || die "docker-compose.yml missing in $PROXY_DIR"
 [[ -x "$STRIX_BIN" ]] || die "strix binary not executable: $STRIX_BIN"
-command -v security >/dev/null || die "macOS 'security' command not found (Keychain unavailable)"
 
-# Fetch proxy API key from the login Keychain. No cleartext key on disk.
-if ! KEY="$(security find-generic-password \
-              -a "$STRIX_PROXY_KEYCHAIN_ACCOUNT" \
-              -s "$STRIX_PROXY_KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
+KEY_SOURCE=""
+if [[ -n "${STRIX_PROXY_API_KEY:-}" ]]; then
+  KEY="$STRIX_PROXY_API_KEY"
+  KEY_SOURCE="STRIX_PROXY_API_KEY"
+elif [[ -n "${LLM_API_KEY:-}" ]]; then
+  KEY="$LLM_API_KEY"
+  KEY_SOURCE="LLM_API_KEY"
+elif command -v security >/dev/null 2>&1 && KEY="$(security find-generic-password \
+       -a "$STRIX_PROXY_KEYCHAIN_ACCOUNT" \
+       -s "$STRIX_PROXY_KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
+  KEY_SOURCE="macOS Keychain"
+else
   cat >&2 <<EOF
-${R}✗${N} Proxy API key not found in Keychain.
-   Service : $STRIX_PROXY_KEYCHAIN_SERVICE
-   Account : $STRIX_PROXY_KEYCHAIN_ACCOUNT
+${R}✗${N} Proxy API key not found.
 
-   Add it (one-time) with:
+   Linux/Kali:
+     export STRIX_PROXY_API_KEY='<your-api-key>'
+
+   macOS Keychain:
      security add-generic-password \\
        -a "$STRIX_PROXY_KEYCHAIN_ACCOUNT" \\
        -s "$STRIX_PROXY_KEYCHAIN_SERVICE" \\
@@ -185,9 +203,8 @@ ${R}✗${N} Proxy API key not found in Keychain.
 EOF
   exit 1
 fi
-# Trim any trailing newline that 'security -w' may print.
 KEY="${KEY%$'\n'}"
-[[ -n "$KEY" ]] || die "Keychain returned an empty API key"
+[[ -n "$KEY" ]] || die "$KEY_SOURCE returned an empty API key"
 
 step "Preflight"
 
@@ -196,6 +213,8 @@ if ! docker info >/dev/null 2>&1; then
   die "Docker daemon not running. Start Docker Desktop first."
 fi
 ok "Docker daemon reachable"
+ok "Proxy API key loaded from $KEY_SOURCE"
+ok "Proxy base: $PROXY_BASE"
 
 # 2. Container state
 container_state="$("${COMPOSE[@]}" ps --format json cli-proxy-api 2>/dev/null | python3 -c '
@@ -247,8 +266,10 @@ fi
 
 # 5. Live token probe (catches expired refresh tokens that /v1/models alone won't detect)
 if [[ "$need_login" -eq 0 && "$STRIX_PROXY_PROBE" == "1" ]]; then
+  probe_file="$(mktemp "${TMPDIR:-/tmp}/strix-proxy-probe.XXXXXX")"
+  trap 'rm -f "$probe_file"' EXIT
   probe_body='{"model":"'"$STRIX_PROXY_MODEL"'","messages":[{"role":"user","content":"ping"}]}'
-  probe_resp="$(curl -sS -o /tmp/strix-proxy-probe.json -w '%{http_code}' \
+  probe_resp="$(curl -sS -o "$probe_file" -w '%{http_code}' \
     -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
     -m 30 -d "$probe_body" "$PROXY_BASE/chat/completions" 2>/dev/null || echo "000")"
   case "$probe_resp" in
@@ -258,7 +279,7 @@ if [[ "$need_login" -eq 0 && "$STRIX_PROXY_PROBE" == "1" ]]; then
       need_login=1 ;;
     *)
       warn "Probe HTTP $probe_resp — assuming token issue; response head:"
-      head -c 400 /tmp/strix-proxy-probe.json 2>/dev/null; printf "\n"
+      head -c 400 "$probe_file" 2>/dev/null; printf "\n"
       need_login=1 ;;
   esac
 fi
