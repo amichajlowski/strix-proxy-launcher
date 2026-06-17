@@ -14,6 +14,116 @@ If this fails, contact the system owner. Normal users should not need to configu
 
 Use Strix only on authorised targets. Do not include personal data, secrets, customer data, or production credentials in prompts or uploaded materials.
 
+## Renew Codex Authentication
+
+If `strix-proxy --version` reports that the Codex token is missing, expired, or the live probe fails, renew the shared Codex OAuth session.
+
+Run this as an administrator on the Kali host:
+
+```bash
+cd /opt/strix-proxy-launcher
+sudo docker compose exec \
+  -e TERM=dumb \
+  -e NO_COLOR=1 \
+  cli-proxy-api \
+  /CLIProxyAPI/CLIProxyAPI -no-browser --codex-login
+```
+
+The command prints an authorisation URL. Open it in a browser, sign in, then copy the full callback URL from the browser address bar and paste it back into the terminal.
+
+The callback URL must start exactly with:
+
+```text
+http://localhost:1455/auth/callback?
+```
+
+Do not paste terminal colour/control characters, extra spaces, or any text before `http`. Treat the callback URL as sensitive.
+
+If the Kali host is remote and the browser is on your local workstation, open an SSH tunnel from your workstation first:
+
+```bash
+ssh -L 1455:127.0.0.1:1455 <user>@<kali-host> -p 22
+```
+
+After successful login, the token is stored inside the shared auth volume:
+
+```text
+/var/lib/strix-proxy/auths/codex-*.json
+```
+
+Then verify:
+
+```bash
+strix-proxy --version
+```
+
+## How The Launcher Works
+
+`strix-proxy` is a wrapper around the real `strix` binary. It does not perform the audit itself.
+
+It performs these steps:
+
+1. Loads `/etc/strix-proxy.env` through the global `/usr/local/bin/strix-proxy` wrapper.
+2. Reads the local proxy API key from `STRIX_PROXY_API_KEY`.
+3. Uses `STRIX_PROXY_BASE`, usually `http://127.0.0.1:8317/v1`, as the OpenAI-compatible endpoint.
+4. Checks Docker and starts the `cli-proxy-api` container if needed.
+5. Calls `/v1/models` to confirm the local proxy accepts the API key.
+6. Checks that a Codex OAuth token exists.
+7. Sends a small `ping` request to confirm the Codex session is still valid.
+8. Exports `STRIX_LLM`, `LLM_API_KEY`, and `LLM_API_BASE`.
+9. Executes the real Strix binary with your original arguments.
+
+Authentication has two layers:
+
+```text
+Strix user -> local proxy API key -> CLIProxyAPI -> Codex OAuth token -> upstream Codex/OpenAI
+```
+
+The `api-keys` values in `/etc/strix-proxy-config.yaml` only protect the local proxy. They are not upstream OpenAI/Codex API keys.
+
+## Run Strix Without The Wrapper
+
+Use the wrapper by default because it validates Docker, proxy auth, and Codex session health before starting Strix.
+
+If you need to run Strix directly, export the same OpenAI-compatible variables yourself:
+
+```bash
+source /etc/strix-proxy.env
+
+export LLM_API_KEY="$STRIX_PROXY_API_KEY"
+export LLM_API_BASE="$STRIX_PROXY_BASE"
+export STRIX_LLM="openai/gpt-5.5"
+
+strix --version
+```
+
+Direct medium scan:
+
+```bash
+source /etc/strix-proxy.env
+LLM_API_KEY="$STRIX_PROXY_API_KEY" \
+LLM_API_BASE="$STRIX_PROXY_BASE" \
+STRIX_LLM="openai/gpt-5.5" \
+strix -t /path/to/repository --scan-mode standard -n
+```
+
+Direct deep scan with explicit reasoning:
+
+```bash
+source /etc/strix-proxy.env
+LLM_API_KEY="$STRIX_PROXY_API_KEY" \
+LLM_API_BASE="$STRIX_PROXY_BASE" \
+STRIX_LLM="openai/gpt-5.5(high)" \
+STRIX_REASONING_EFFORT=high \
+strix -t /path/to/repository --scan-mode deep -n
+```
+
+Direct mode skips the launcher's preflight checks. If Strix fails in direct mode, first verify the proxy:
+
+```bash
+strix-proxy --version
+```
+
 ## Basic Command Format
 
 ```bash
@@ -324,4 +434,3 @@ If the Codex session expires, ask the system owner to renew OAuth:
 cd /opt/strix-proxy-launcher
 sudo docker compose exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-login
 ```
-
